@@ -549,8 +549,6 @@ Your application will be live in minutes.
 
 **Prince Pandit**
 
-📧 Email: iamprince1606@gmail.com
-
 💼 AI/ML Developer | Generative AI Enthusiast
 
 ---
