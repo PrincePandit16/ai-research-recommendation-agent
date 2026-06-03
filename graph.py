@@ -1,10 +1,19 @@
-from typing import TypedDict, Optional
+from typing import TypedDict
 from groq import Groq
+
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
+
 
 
 
 class AgentState(TypedDict, total=False):
     company: str
+    web_search: str         
+    web_sources: list        
     company_overview: str
     key_business_info: str
     challenges: str
@@ -14,8 +23,62 @@ class AgentState(TypedDict, total=False):
 
 
 
+def node_web_search(state: AgentState, tavily_client=None) -> AgentState:
+    """Fetch real-time company data from the web using Tavily."""
+    company = state['company']
+
+    if tavily_client is None or not TAVILY_AVAILABLE:
+        return {
+            **state,
+            "web_search": f"[Web search skipped — no Tavily key provided. Analysis will use LLM training data only.]",
+            "web_sources": []
+        }
+
+    queries = [
+        f"{company} latest news 2024 2025",
+        f"{company} expansion plans recent developments",
+        f"{company} revenue business performance",
+    ]
+
+    all_results = []
+    sources = []
+
+    for query in queries:
+        try:
+            response = tavily_client.search(
+                query=query,
+                search_depth="basic",
+                max_results=3,
+                include_answer=True,
+            )
+            if response.get("answer"):
+                all_results.append(f"**Query:** {query}\n**Summary:** {response['answer']}")
+
+            for r in response.get("results", []):
+                snippet = r.get("content", "")[:400]
+                all_results.append(f"**Source:** {r.get('title', '')}\n{snippet}")
+                sources.append({
+                    "title": r.get("title", ""),
+                    "url":   r.get("url", ""),
+                    "date":  r.get("published_date", "recent"),
+                })
+        except Exception as e:
+            all_results.append(f"[Search error for '{query}': {str(e)}]")
+
+    combined = "\n\n---\n\n".join(all_results[:8])  # cap context size
+    return {
+        **state,
+        "web_search": combined,
+        "web_sources": sources[:9],
+    }
+
+
+
 def node_company_overview(state: AgentState, client: Groq, model: str) -> AgentState:
-    prompt = f"""You are a senior business analyst. Write a concise company overview for **{state['company']}**.
+    live_data = state.get("web_search", "")
+    live_section = f"\n\nRECENT WEB DATA (use this to enrich your answer with current facts):\n---\n{live_data}\n---" if live_data and "skipped" not in live_data else ""
+
+    prompt = f"""You are a senior business analyst. Write a concise company overview for **{state['company']}**.{live_section}
 
 Cover exactly these points (use markdown headers):
 ### What the Company Does
@@ -23,30 +86,33 @@ Cover exactly these points (use markdown headers):
 ### Scale (employees, revenue range, market position)
 ### Geographic Presence
 
-Be specific and factual. 200-250 words max. Use bullet points inside each section."""
+Be specific and factual. Where recent web data is available, reference it. 200-250 words. Use bullet points."""
 
-    result = _call_groq(client, model, prompt)
-    return {**state, "company_overview": result}
+    return {**state, "company_overview": _call_groq(client, model, prompt)}
+
 
 
 def node_key_business_info(state: AgentState, client: Groq, model: str) -> AgentState:
-    prompt = f"""You are a business intelligence analyst. Based on your knowledge of **{state['company']}**, provide key business information.
+    live_data = state.get("web_search", "")
+    live_section = f"\nRecent web data:\n---\n{live_data[:1200]}\n---" if live_data and "skipped" not in live_data else ""
 
-Use the context below for reference:
+    prompt = f"""You are a business intelligence analyst. Provide key business information for **{state['company']}**.
+
+Company overview context:
 ---
 {state.get('company_overview', '')}
----
+---{live_section}
 
-Now provide:
+Provide:
 ### Major Products & Services
-### Recent Developments (last 1-2 years)
+### Recent Developments (last 1-2 years — prioritise any web data above)
 ### Expansion Plans & Strategic Moves
 ### Key Partnerships / Clients / Awards
 
-Be specific to this company. 220-260 words. Use bullet points."""
+Be specific. If web data contradicts training data, prefer web data as more recent. 220-260 words."""
 
-    result = _call_groq(client, model, prompt)
-    return {**state, "key_business_info": result}
+    return {**state, "key_business_info": _call_groq(client, model, prompt)}
+
 
 
 def node_challenges(state: AgentState, client: Groq, model: str) -> AgentState:
@@ -68,21 +134,24 @@ Identify challenges under these categories. For each challenge, explain WHY it a
 
 Do NOT give generic answers. Tie each point back to the company's scale, geography, and sector. 250-300 words."""
 
-    result = _call_groq(client, model, prompt)
-    return {**state, "challenges": result}
+    return {**state, "challenges": _call_groq(client, model, prompt)}
+
 
 
 def node_ai_opportunities(state: AgentState, client: Groq, model: str) -> AgentState:
-    prompt = f"""You are an AI solutions architect. Based on the specific challenges of **{state['company']}**, recommend concrete AI use cases.
+    live_data = state.get("web_search", "")
+    live_section = f"\nLatest company context from web:\n{live_data[:800]}" if live_data and "skipped" not in live_data else ""
+
+    prompt = f"""You are an AI solutions architect. Recommend concrete AI use cases for **{state['company']}**.
 
 Company context:
 ---
 {state.get('company_overview', '')}
 Challenges identified:
 {state.get('challenges', '')}
----
+---{live_section}
 
-For each opportunity below, give:
+For each opportunity, give:
 - **What to build** (1 sentence)
 - **How it helps** (specific to this company's pain)
 - **Feasibility** (Easy / Medium / Complex)
@@ -93,47 +162,45 @@ For each opportunity below, give:
 ### 4. Document Processing & Compliance
 ### 5. Analytics & Forecasting Dashboard
 
-Be hyper-specific. Reference actual pain points from the challenges section. 280-320 words."""
+Be hyper-specific. Reference actual pain points. 280-320 words."""
 
-    result = _call_groq(client, model, prompt)
-    return {**state, "ai_opportunities": result}
+    return {**state, "ai_opportunities": _call_groq(client, model, prompt)}
+
 
 
 def node_pitch_generator(state: AgentState, client: Groq, model: str) -> AgentState:
     company = state['company']
     prompt = f"""You are an AI consultant preparing to meet the CEO of **{company}**.
 
-Write a one-page personalized pitch. Use this structure:
+Write a one-page personalized pitch:
 
 ---
 **Subject: Unlocking AI-Driven Growth for {company}**
 
 **Opening — Why I Reached Out**
-(2-3 sentences. Reference something specific about the company's scale, expansion, or recent news.)
+(2-3 sentences referencing specific recent developments or scale.)
 
 **What I Found — Your Key Opportunities**
-(3-4 bullet points. Each maps a specific company challenge → an AI solution. Be precise.)
+(3-4 bullets. Each: specific challenge → specific AI solution.)
 
 **My Recommendation — Where to Start**
-(Pick the single highest-ROI AI initiative. Explain the 90-day roadmap in 3 steps.)
+(Highest-ROI initiative. 3-step 90-day roadmap.)
 
 **Why Now**
-(1 paragraph. Reference industry trends, competitive pressure, or timing specific to their sector.)
+(Industry trends, competitive pressure, timing.)
 
 **Call to Action**
-(One clear ask — a 30-minute call, a pilot proposal, etc.)
-
+(One clear ask.)
 ---
 
-Use the research below to personalize every line:
-Company Overview: {state.get('company_overview', '')}
+Use all research below:
+Overview: {state.get('company_overview', '')}
 Challenges: {state.get('challenges', '')}
 AI Opportunities: {state.get('ai_opportunities', '')}
 
-Tone: confident, respectful, CEO-ready. No fluff. 300-350 words total."""
+Tone: confident, CEO-ready, no fluff. 300-350 words."""
 
-    result = _call_groq(client, model, prompt)
-    return {**state, "pitch_generator": result}
+    return {**state, "pitch_generator": _call_groq(client, model, prompt)}
 
 
 
@@ -141,15 +208,12 @@ def _call_groq(client: Groq, model: str, prompt: str, temperature: float = 0.55)
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert business analyst and AI consultant. "
-                    "You provide accurate, specific, and actionable insights. "
-                    "Never give generic or filler content. "
-                    "Always ground your analysis in the company's specific context."
-                )
-            },
+            {"role": "system", "content": (
+                "You are an expert business analyst and AI consultant. "
+                "Provide accurate, specific, actionable insights. "
+                "Never give generic content. Ground analysis in the company's specific context. "
+                "When recent web data is provided, prioritise it over older training knowledge."
+            )},
             {"role": "user", "content": prompt}
         ],
         temperature=temperature,
@@ -158,34 +222,41 @@ def _call_groq(client: Groq, model: str, prompt: str, temperature: float = 0.55)
     return response.choices[0].message.content.strip()
 
 
+
+
 class ResearchGraph:
     """
     Sequential LangGraph-style graph.
-    Each node enriches the shared AgentState.
+    Flow: web_search → company_overview → key_business_info
+          → challenges → ai_opportunities → pitch_generator
     """
 
-    NODE_MAP = {
-        "company_overview":  node_company_overview,
-        "key_business_info": node_key_business_info,
-        "challenges":        node_challenges,
-        "ai_opportunities":  node_ai_opportunities,
-        "pitch_generator":   node_pitch_generator,
-    }
-
-    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile"):
-        self.client = Groq(api_key=api_key)
-        self.model  = model
+    def __init__(self, groq_api_key: str, tavily_api_key: str = "",
+                 model: str = "llama-3.3-70b-versatile"):
+        self.groq_client = Groq(api_key=groq_api_key)
+        self.model = model
+        self.tavily_client = None
+        if tavily_api_key and TAVILY_AVAILABLE:
+            self.tavily_client = TavilyClient(api_key=tavily_api_key)
 
     def run_node(self, node_key: str, state: AgentState) -> AgentState:
-        """Run a single named node and return the updated state."""
-        fn = self.NODE_MAP.get(node_key)
+        if node_key == "web_search":
+            return node_web_search(state, self.tavily_client)
+        node_map = {
+            "company_overview":  node_company_overview,
+            "key_business_info": node_key_business_info,
+            "challenges":        node_challenges,
+            "ai_opportunities":  node_ai_opportunities,
+            "pitch_generator":   node_pitch_generator,
+        }
+        fn = node_map.get(node_key)
         if fn is None:
             raise ValueError(f"Unknown node: {node_key}")
-        return fn(state, self.client, self.model)
+        return fn(state, self.groq_client, self.model)
 
     def run_all(self, company: str) -> AgentState:
-        """Run the full graph from START to END."""
         state: AgentState = {"company": company}
-        for key in self.NODE_MAP:
+        for key in ["web_search", "company_overview", "key_business_info",
+                    "challenges", "ai_opportunities", "pitch_generator"]:
             state = self.run_node(key, state)
         return state
